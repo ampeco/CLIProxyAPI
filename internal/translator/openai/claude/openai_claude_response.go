@@ -158,8 +158,18 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			// Don't send content_block_start for text here - wait for actual content
 		}
 
-		// Handle reasoning content delta
-		if reasoning := delta.Get("reasoning_content"); reasoning.Exists() {
+		// Handle reasoning content delta.
+		// ampeco fork patch: fall back to "reasoning" when "reasoning_content" is empty/absent.
+		// OpenRouter emits the field as `reasoning`; upstream CLIProxyAPI only looks at
+		// `reasoning_content`, which silently drops reasoning blocks for all OpenRouter-backed
+		// providers (kimi, qwen, glm, deepseek, minimax, ...). Strict-additive: when both fields
+		// are present, `reasoning_content` still wins, so providers that emit it (OpenAI o-series,
+		// DeepSeek direct) are unaffected.
+		reasoning := delta.Get("reasoning_content")
+		if !reasoning.Exists() || reasoning.String() == "" {
+			reasoning = delta.Get("reasoning")
+		}
+		if reasoning.Exists() {
 			for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
 				if reasoningText == "" {
 					continue
@@ -397,7 +407,13 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
 		choice := choices.Array()[0] // Take first choice
 
+		// ampeco fork patch: fall back to "reasoning" when "reasoning_content" is empty/absent.
+		// OpenRouter emits the field as `reasoning`; see the streaming-path comment for the full
+		// rationale. Same strict-additive semantics — `reasoning_content` wins when present.
 		reasoningNode := choice.Get("message.reasoning_content")
+		if !reasoningNode.Exists() || reasoningNode.String() == "" {
+			reasoningNode = choice.Get("message.reasoning")
+		}
 		for _, reasoningText := range collectOpenAIReasoningTexts(reasoningNode) {
 			if reasoningText == "" {
 				continue
@@ -658,7 +674,14 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 				}
 			}
 
-			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
+			// ampeco fork patch: fall back to "reasoning" when "reasoning_content" is empty/absent.
+			// OpenRouter emits the field as `reasoning`; see the streaming-path comment for the full
+			// rationale. Same strict-additive semantics — `reasoning_content` wins when present.
+			reasoning := message.Get("reasoning_content")
+			if !reasoning.Exists() || reasoning.String() == "" {
+				reasoning = message.Get("reasoning")
+			}
+			if reasoning.Exists() {
 				for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
 					if reasoningText == "" {
 						continue
