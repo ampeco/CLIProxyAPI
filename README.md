@@ -1,4 +1,66 @@
-# CLI Proxy API
+# CLI Proxy API — ampeco fork
+
+> **This is AMPECO's maintained fork of [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).**
+> The deployed binary on `mm007` is built from this fork, not from upstream. The upstream README is preserved below for reference.
+
+## Why this fork exists
+
+AMPECO's CoOperator development fleet runs CLIProxyAPI on `mm007` as the single Claude/Anthropic + OpenRouter-alt-provider gateway for all 10 minis (story [#988867](https://app.shortcut.com/ampeco/story/988867)). End-to-end validation on 2026-05-15 surfaced two protocol-translation gaps that affect every OpenAI-compatible provider going through OpenRouter (and likely beyond). Both gaps are closed by small, strict-additive patches that we own here.
+
+## Patch series
+
+The fork carries the following patches on top of upstream. Each patch is monotonically additive — it only fires when its condition is met, so providers that don't trigger it are unaffected.
+
+### Patch 1 — `reasoning` field fallback in OpenAI→Claude response translator
+
+**File:** `internal/translator/openai/claude/openai_claude_response.go` (three call sites)
+**Symptom:** OpenRouter emits the reasoning field as `reasoning`; upstream only looks for `reasoning_content`. Result: reasoning blocks silently disappear from all OpenRouter-backed providers (kimi, qwen, glm, deepseek, minimax, ...).
+**Fix:** when `reasoning_content` is empty/absent, fall back to `reasoning`. When both are present, `reasoning_content` still wins — providers that emit it (OpenAI o-series, DeepSeek direct) keep working unchanged.
+
+### Patch 2 — strip `cache_control` markers in Claude→OpenAI request translator
+
+**File:** `internal/translator/openai/claude/openai_claude_request.go` (new `stripCacheControl` helper applied at the top of `ConvertClaudeRequestToOpenAI`)
+**Symptom:** Anthropic clients embed `cache_control` markers (used for Anthropic prompt caching) on `messages[].content[]`, `system[]`, and `tools[]`. Upstream's Claude→OpenAI request translator has no defined handling for this; OpenAI-compatible providers either ignore the field silently or may reject the request.
+**Fix:** strip `cache_control` from message content items, system items, tools entries, and message-level fields before translation. Mirrors CCR's `OpenrouterTransformer` (lines 17-29). Applied universally because the field has no valid meaning on the Claude→OpenAI path.
+
+Together, both patches are roughly 30 lines of code across two files.
+
+## Tests
+
+Each patch ships with a Go unit test so future rebases catch regressions:
+
+- `internal/translator/openai/claude/openai_claude_response_test.go` — `TestConvertOpenAIResponseToClaude_ReasoningFallback` covers all three sites (streaming, non-stream path 1, non-stream path 2) and the strict-additive property (`reasoning_content` wins when both fields are present).
+- `internal/translator/openai/claude/openai_claude_request_test.go` — `TestConvertClaudeRequestToOpenAI_StripsCacheControl`, `TestConvertClaudeRequestToOpenAI_PreservesContentWhenStrippingCacheControl`, and `TestStripCacheControl_IsIdempotent` cover all the locations where `cache_control` can appear, verify the surrounding content is preserved, and verify idempotency.
+
+Run them with:
+
+```bash
+go test ./internal/translator/openai/claude/...
+```
+
+## Rebase cadence
+
+Monthly intentional rebase against upstream — we **do not** auto-pull. We bump to known-good upstream tags only after verifying the patch series still applies cleanly. The patches are small and benign, so rebase cost should stay near zero unless upstream restructures the translators.
+
+When rebasing:
+
+1. `git fetch upstream`
+2. Cherry-pick (or rebase) AMPECO patches on top of the new upstream tag.
+3. Run `go test ./...` — the patch tests must pass.
+4. Cut a new release tag of the form `vX.Y.Z-ampeco` and attach a macOS arm64 binary.
+5. Update the pinned version in `gitlab.com/ampeco/devops/ansible` `roles/cliproxyapi/`.
+
+## Escalation
+
+If maintenance cost grows beyond ~1 hour per rebase, options are:
+
+1. Contribute the patches upstream (preferred long-term).
+2. Accept divergence indefinitely (current default).
+3. Drop the alt-provider use case from this proxy and keep CCR for those, using the fork only for the Anthropic pool.
+
+---
+
+# CLI Proxy API (upstream README)
 
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
