@@ -17,7 +17,12 @@ import (
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the OpenAI API.
 func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := inputRawJSON
+	// ampeco fork patch: strip Anthropic `cache_control` markers from the input before
+	// translation. `cache_control` is Anthropic-only (prompt caching) and has no defined
+	// meaning in any OpenAI-compatible API; OpenAI-compat backends either ignore it silently
+	// or may reject the request. Mirrors CCR's `OpenrouterTransformer` (lines 17-29).
+	// Applied universally because the field has no valid meaning on the Claude->OpenAI path.
+	rawJSON := stripCacheControl(inputRawJSON)
 	// Base OpenAI Chat Completions API template
 	out := []byte(`{"model":"","messages":[]}`)
 
@@ -323,6 +328,62 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	// Handle user parameter (for tracking)
 	if user := root.Get("user"); user.Exists() {
 		out, _ = sjson.SetBytes(out, "user", user.String())
+	}
+
+	return out
+}
+
+// stripCacheControl removes Anthropic `cache_control` markers from a Claude-format request
+// before it is translated to OpenAI format. Anthropic uses `cache_control` for prompt caching;
+// it appears (a) on individual content items inside `messages[*].content[]`, (b) on individual
+// `system[]` items, and (c) on `tools[]` entries. None of these have any meaning in an
+// OpenAI-compatible request body, so we delete them here unconditionally.
+//
+// ampeco fork patch — see ConvertClaudeRequestToOpenAI for the full rationale.
+func stripCacheControl(rawJSON []byte) []byte {
+	if len(rawJSON) == 0 {
+		return rawJSON
+	}
+	out := rawJSON
+	root := gjson.ParseBytes(out)
+
+	// Strip from messages[*].content[*].cache_control
+	if messages := root.Get("messages"); messages.IsArray() {
+		messages.ForEach(func(msgKey, message gjson.Result) bool {
+			// Strip top-level message cache_control (rare but legal in some clients)
+			if message.Get("cache_control").Exists() {
+				out, _ = sjson.DeleteBytes(out, "messages."+msgKey.Raw+".cache_control")
+			}
+			if content := message.Get("content"); content.IsArray() {
+				content.ForEach(func(partKey, part gjson.Result) bool {
+					if part.Get("cache_control").Exists() {
+						out, _ = sjson.DeleteBytes(out, "messages."+msgKey.Raw+".content."+partKey.Raw+".cache_control")
+					}
+					return true
+				})
+			}
+			return true
+		})
+	}
+
+	// Strip from system[*].cache_control (when system is provided as an array of content blocks)
+	if system := gjson.GetBytes(out, "system"); system.IsArray() {
+		system.ForEach(func(partKey, part gjson.Result) bool {
+			if part.Get("cache_control").Exists() {
+				out, _ = sjson.DeleteBytes(out, "system."+partKey.Raw+".cache_control")
+			}
+			return true
+		})
+	}
+
+	// Strip from tools[*].cache_control
+	if tools := gjson.GetBytes(out, "tools"); tools.IsArray() {
+		tools.ForEach(func(toolKey, tool gjson.Result) bool {
+			if tool.Get("cache_control").Exists() {
+				out, _ = sjson.DeleteBytes(out, "tools."+toolKey.Raw+".cache_control")
+			}
+			return true
+		})
 	}
 
 	return out

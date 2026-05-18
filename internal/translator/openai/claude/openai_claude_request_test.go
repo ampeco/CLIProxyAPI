@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -694,5 +695,158 @@ func TestConvertClaudeRequestToOpenAI_AssistantThinkingToolUseThinkingSplit(t *t
 	// Should have combined reasoning_content from both thinking blocks
 	if got := assistantMsg.Get("reasoning_content").String(); got != "t1\n\nt2" {
 		t.Fatalf("Expected reasoning_content %q, got %q", "t1\n\nt2", got)
+	}
+}
+
+// TestConvertClaudeRequestToOpenAI_StripsCacheControl verifies the ampeco fork patch
+// that strips Anthropic `cache_control` markers from the input before translating to
+// OpenAI format. `cache_control` is Anthropic-only (prompt caching) and has no defined
+// meaning in any OpenAI-compatible API. Every translated payload MUST be free of any
+// `cache_control` field anywhere in the JSON tree.
+func TestConvertClaudeRequestToOpenAI_StripsCacheControl(t *testing.T) {
+	tests := []struct {
+		name      string
+		inputJSON string
+	}{
+		{
+			name: "cache_control on message content text item",
+			inputJSON: `{
+				"model": "claude-3-opus",
+				"messages": [{
+					"role": "user",
+					"content": [
+						{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+					]
+				}]
+			}`,
+		},
+		{
+			name: "cache_control on system[] item",
+			inputJSON: `{
+				"model": "claude-3-opus",
+				"system": [
+					{"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}}
+				],
+				"messages": [{
+					"role": "user",
+					"content": "hello"
+				}]
+			}`,
+		},
+		{
+			name: "cache_control on tools[] entry",
+			inputJSON: `{
+				"model": "claude-3-opus",
+				"messages": [{
+					"role": "user",
+					"content": "use a tool"
+				}],
+				"tools": [
+					{"name": "search", "description": "search the web", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}}
+				]
+			}`,
+		},
+		{
+			name: "cache_control at message level (top-level field on a message)",
+			inputJSON: `{
+				"model": "claude-3-opus",
+				"messages": [{
+					"role": "user",
+					"content": [{"type": "text", "text": "hello"}],
+					"cache_control": {"type": "ephemeral"}
+				}]
+			}`,
+		},
+		{
+			name: "cache_control on multiple content items across multiple messages",
+			inputJSON: `{
+				"model": "claude-3-opus",
+				"messages": [
+					{
+						"role": "user",
+						"content": [
+							{"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}},
+							{"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}}
+						]
+					},
+					{
+						"role": "assistant",
+						"content": [
+							{"type": "text", "text": "third", "cache_control": {"type": "ephemeral"}}
+						]
+					}
+				]
+			}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ConvertClaudeRequestToOpenAI("test-model", []byte(tt.inputJSON), false)
+			// The translated OpenAI payload MUST NOT contain `cache_control` anywhere.
+			// A simple byte-substring check is sufficient and resilient against future
+			// translator restructuring — the patch invariant is: the field name never
+			// appears in the output, period.
+			if bytes.Contains(result, []byte("cache_control")) {
+				t.Fatalf("expected translated OpenAI payload to not contain cache_control, got %s", result)
+			}
+			// Sanity check: the translated payload should still be valid JSON.
+			if !gjson.ValidBytes(result) {
+				t.Fatalf("translated payload is not valid JSON: %s", result)
+			}
+		})
+	}
+}
+
+// TestConvertClaudeRequestToOpenAI_PreservesContentWhenStrippingCacheControl ensures
+// the cache_control strip pass doesn't drop the surrounding content. We pass a request
+// with cache_control on a text content item and assert the text still arrives.
+func TestConvertClaudeRequestToOpenAI_PreservesContentWhenStrippingCacheControl(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [{
+			"role": "user",
+			"content": [
+				{"type": "text", "text": "preserve me", "cache_control": {"type": "ephemeral"}}
+			]
+		}]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	parsed := gjson.ParseBytes(result)
+
+	// Find the user message text content
+	var gotText string
+	parsed.Get("messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() != "user" {
+			return true
+		}
+		msg.Get("content").ForEach(func(_, item gjson.Result) bool {
+			if item.Get("type").String() == "text" {
+				gotText = item.Get("text").String()
+				return false
+			}
+			return true
+		})
+		return false
+	})
+
+	if gotText != "preserve me" {
+		t.Fatalf("expected user text %q to survive cache_control strip, got %q (full=%s)", "preserve me", gotText, result)
+	}
+}
+
+// TestStripCacheControl_IsIdempotent ensures stripCacheControl is safe to call repeatedly
+// and is a no-op when the input has no cache_control markers.
+func TestStripCacheControl_IsIdempotent(t *testing.T) {
+	clean := []byte(`{"model":"claude-3-opus","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	out1 := stripCacheControl(clean)
+	out2 := stripCacheControl(out1)
+	if !bytes.Equal(out1, out2) {
+		t.Fatalf("stripCacheControl should be idempotent; got %q vs %q", out1, out2)
+	}
+	// And the clean input should be byte-identical to the output (no spurious mutations).
+	if !bytes.Equal(clean, out1) {
+		t.Fatalf("stripCacheControl should be a no-op on clean input; got %q vs %q", clean, out1)
 	}
 }
