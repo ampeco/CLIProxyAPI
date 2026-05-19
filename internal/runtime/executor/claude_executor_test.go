@@ -2261,3 +2261,84 @@ func TestRestoreClaudeOAuthToolNamesFromStreamLine_MixedCaseWithPrefix(t *testin
 		t.Fatalf("Glob should be restored to glob, got: %s", string(out))
 	}
 }
+
+// TestApplyClaudeHeaders_OAuthAccessTokenUsesBearerAuth verifies ampeco Patch 3.
+//
+// Background: CLIProxyAPI's `claude-api-key:` config array is designed for
+// `sk-ant-api03-*` API keys, which Anthropic accepts via the `x-api-key`
+// header. The Cooperator fleet stores `sk-ant-oat01-*` OAuth access tokens in
+// the same array (mapped from Ansible vault). Without Patch 3 the proxy
+// forwards them via `x-api-key` too; Anthropic returns 401 "invalid x-api-key"
+// whenever a `claude-code-*` beta is requested.
+//
+// Patch 3 detects the `sk-ant-oat01-` prefix and routes those tokens via
+// `Authorization: Bearer …` while keeping the existing behaviour for real
+// API keys.
+func TestApplyClaudeHeaders_OAuthAccessTokenUsesBearerAuth(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "auth-oauth",
+		Attributes: map[string]string{
+			"api_key": "sk-ant-oat01-fake-oauth-token-for-test",
+		},
+	}
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+
+	applyClaudeHeaders(req, auth, "sk-ant-oat01-fake-oauth-token-for-test", false, nil, &config.Config{})
+
+	if got := req.Header.Get("Authorization"); got != "Bearer sk-ant-oat01-fake-oauth-token-for-test" {
+		t.Fatalf("Authorization = %q, want Bearer sk-ant-oat01-fake-oauth-token-for-test", got)
+	}
+	if got := req.Header.Get("x-api-key"); got != "" {
+		t.Fatalf("x-api-key = %q, want empty (OAuth tokens must not be sent via x-api-key)", got)
+	}
+}
+
+// TestApplyClaudeHeaders_ApiKeyStillUsesXApiKey verifies that the Patch 3
+// detection is strict-additive: real `sk-ant-api03-*` API keys keep the
+// previous `x-api-key` routing exactly as before.
+func TestApplyClaudeHeaders_ApiKeyStillUsesXApiKey(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "auth-apikey",
+		Attributes: map[string]string{
+			"api_key": "sk-ant-api03-fake-real-api-key-for-test",
+		},
+	}
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+
+	applyClaudeHeaders(req, auth, "sk-ant-api03-fake-real-api-key-for-test", false, nil, &config.Config{})
+
+	if got := req.Header.Get("x-api-key"); got != "sk-ant-api03-fake-real-api-key-for-test" {
+		t.Fatalf("x-api-key = %q, want sk-ant-api03-fake-real-api-key-for-test", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization = %q, want empty for real API keys", got)
+	}
+}
+
+// TestClaudeExecutor_PrepareRequest_OAuthAccessTokenUsesBearerAuth verifies the
+// same Patch 3 behaviour in the second auth-header site — the public
+// `PrepareRequest` method — to guard against future refactors splitting the
+// two paths.
+func TestClaudeExecutor_PrepareRequest_OAuthAccessTokenUsesBearerAuth(t *testing.T) {
+	exec := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-oauth-prepare",
+		Attributes: map[string]string{
+			"api_key": "sk-ant-oat01-fake-prepare-oauth",
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	req.Header.Set("Authorization", "Bearer should-be-replaced")
+	req.Header.Set("x-api-key", "should-be-removed")
+
+	if err := exec.PrepareRequest(req, auth); err != nil {
+		t.Fatalf("PrepareRequest returned error: %v", err)
+	}
+
+	if got := req.Header.Get("Authorization"); got != "Bearer sk-ant-oat01-fake-prepare-oauth" {
+		t.Fatalf("Authorization = %q, want Bearer sk-ant-oat01-fake-prepare-oauth", got)
+	}
+	if got := req.Header.Get("x-api-key"); got != "" {
+		t.Fatalf("x-api-key = %q, want empty (Patch 3 must scrub the wrong header)", got)
+	}
+}

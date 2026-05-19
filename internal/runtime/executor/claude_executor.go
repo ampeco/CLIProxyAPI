@@ -96,7 +96,11 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	}
 	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
 	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	// ampeco Patch 3: OAuth access tokens (`sk-ant-oat01-*`) must use
+	// `Authorization: Bearer …`. Anthropic returns 401 when an OAuth token
+	// arrives via `x-api-key` and any `claude-code-*` beta is requested.
+	isOAuthAccessToken := strings.HasPrefix(strings.TrimSpace(apiKey), "sk-ant-oat01-")
+	if isAnthropicBase && useAPIKey && !isOAuthAccessToken {
 		req.Header.Del("Authorization")
 		req.Header.Set("x-api-key", apiKey)
 	} else {
@@ -929,7 +933,11 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
 	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
-	if isAnthropicBase && useAPIKey {
+	// ampeco Patch 3: OAuth access tokens (`sk-ant-oat01-*`) must use
+	// `Authorization: Bearer …`. Anthropic returns 401 when an OAuth token
+	// arrives via `x-api-key` and any `claude-code-*` beta is requested.
+	isOAuthAccessToken := strings.HasPrefix(strings.TrimSpace(apiKey), "sk-ant-oat01-")
+	if isAnthropicBase && useAPIKey && !isOAuthAccessToken {
 		r.Header.Del("Authorization")
 		r.Header.Set("x-api-key", apiKey)
 	} else {
