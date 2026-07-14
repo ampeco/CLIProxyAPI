@@ -26,11 +26,11 @@ When the credential's API key starts with `sk-ant-oat01-`, route via `Authorizat
 
 ### Patch 4 — strip Claude entries from the `antigravity` model catalog
 
-`internal/registry/models/models.json` and `.github/workflows/release.yaml` (post-refresh step).
+`internal/registry/models/models.json` and `.github/scripts/refresh-model-catalogs.sh` (post-refresh strip; the script is invoked by every build job in `release.yaml`).
 
 Antigravity's published catalog includes `claude-opus-4-6-thinking` and `claude-sonnet-4-6` because Google's AI Code Assist tier resells Claude models via `cloudcode-pa.googleapis.com`. With those entries present, an antigravity OAuth becomes eligible alongside the Anthropic OAuth pool when the selector picks for `claude-*` routes. Session-affinity then pins entire Claude Code sessions (parent + sub-agents) to the antigravity OAuth whenever the parent request was a Gemini call, exhausting Antigravity's small Sonnet quota within hours.
 
-Strip every entry whose `id` starts with `claude-`, whose `type` is `claude`, or whose `owned_by` is `anthropic` from the `antigravity` array. Applied both to the in-tree `models.json` (so `go test ./...` and local dev see the patched shape) and to the release workflow's post-refresh step (so upstream catalog refreshes during tagged builds re-apply the strip automatically). After the patch the antigravity OAuth is Gemini-only and Claude requests fall through to the Anthropic OAuth pool.
+Strip every entry whose `id` starts with `claude-`, whose `type` is `claude`, or whose `owned_by` is `anthropic` from the `antigravity` array. Applied both to the in-tree `models.json` (so `go test ./...` and local dev see the patched shape) and to `.github/scripts/refresh-model-catalogs.sh` (so upstream catalog refreshes during tagged builds re-apply the strip automatically). After the patch the antigravity OAuth is Gemini-only and Claude requests fall through to the Anthropic OAuth pool.
 
 ## Tests
 
