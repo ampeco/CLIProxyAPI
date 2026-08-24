@@ -18,11 +18,9 @@ When `reasoning_content` is absent or empty in the upstream response, fall back 
 
 Remove `cache_control` from `messages[].content[]`, `system[]`, `tools[]`, and message-level fields before translation.
 
-### Patch 3 — OAuth access tokens use `Authorization: Bearer …` (Claude executor auth)
+### Patch 3 — RETIRED (upstream since v7.2.140, deployment uses OAuth files)
 
-`internal/runtime/executor/claude_executor.go` (two call sites: `PrepareRequest` and `applyClaudeHeaders`).
-
-When the credential's API key starts with `sk-ant-oat01-`, route via `Authorization: Bearer …` instead of `x-api-key`. Real `sk-ant-api03-*` API keys keep the existing `x-api-key` routing.
+Previously: OAuth access tokens (`sk-ant-oat01-*`) stored in `claude-api-key:` entries were routed via `Authorization: Bearer …` instead of `x-api-key`. Retired in the v7.2.140 sync because (a) upstream now detects OAuth tokens natively (`isClaudeOAuthToken` in `internal/runtime/executor/claude_executor_request.go` forces Bearer on the request path), and (b) the AMPECO deployment migrated from `claude-api-key:` token entries to OAuth credential files (`--claude-login`), so the api-key code path no longer carries OAuth tokens at all.
 
 ### Patch 4 — strip Claude entries from the `antigravity` model catalog
 
@@ -35,9 +33,8 @@ Strip every entry whose `id` starts with `claude-`, whose `type` is `claude`, or
 ## Tests
 
 ```bash
-go test ./internal/translator/openai/claude/...                                                     # Patches 1 + 2
-go test ./internal/runtime/executor/ -run 'OAuthAccessTokenUsesBearerAuth|ApiKeyStillUsesXApiKey'   # Patch 3
-go test ./internal/registry/...                                                                     # Patch 4 (catalog integrity)
+go test ./internal/translator/openai/claude/...   # Patches 1 + 2
+go test ./internal/registry/...                    # Patch 4 (catalog integrity)
 ```
 
 ## Rebase
