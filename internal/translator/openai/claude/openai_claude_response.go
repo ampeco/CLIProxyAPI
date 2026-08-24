@@ -8,6 +8,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -314,14 +315,8 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		if !param.ContentBlocksStopped {
 			for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
 				accumulator := param.ToolCallsAccumulator[index]
-				if !accumulator.StartEmitted {
-					// Belated emit for streams that supplied a valid name but
-					// never sent an id. SanitizeClaudeToolID("") produces the
-					// expected stable synthetic toolu_<nanos>_<n> ID shape.
-					if accumulator.Name == "" {
-						continue
-					}
-					emitToolUseStart(param, index, accumulator, &results)
+				if !emitBelatedToolUseStart(param, index, accumulator, &results) {
+					continue
 				}
 				blockIndex := param.toolContentBlockIndex(index)
 
@@ -346,7 +341,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 	// Handle usage information separately (this comes in a later chunk)
 	// Only process if usage has actual values (not null)
-	if param.FinishReason != "" {
+	if param.FinishReason != "" && !param.MessageDeltaSent {
 		usage := root.Get("usage")
 		var inputTokens, outputTokens, cachedTokens int64
 		if usage.Exists() && usage.Type != gjson.Null {
@@ -387,13 +382,8 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 	if !param.ContentBlocksStopped {
 		for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
 			accumulator := param.ToolCallsAccumulator[index]
-			if !accumulator.StartEmitted {
-				// Belated emit at [DONE]; same behavior as the finish_reason
-				// path for name-but-no-id streams.
-				if accumulator.Name == "" {
-					continue
-				}
-				emitToolUseStart(param, index, accumulator, &results)
+			if !emitBelatedToolUseStart(param, index, accumulator, &results) {
+				continue
 			}
 			blockIndex := param.toolContentBlockIndex(index)
 
@@ -436,6 +426,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 	// Process message content and tool calls
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
 		choice := choices.Array()[0] // Take first choice
+		var contentBlocks [][]byte
 
 		// ampeco fork patch: fall back to "reasoning" when "reasoning_content" is empty/absent.
 		// OpenRouter emits the field as `reasoning`; see the streaming-path comment for the full
@@ -450,14 +441,14 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 			}
 			block := []byte(`{"type":"thinking","thinking":""}`)
 			block, _ = sjson.SetBytes(block, "thinking", reasoningText)
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
+			contentBlocks = append(contentBlocks, block)
 		}
 
 		// Handle text content
 		if content := choice.Get("message.content"); content.Exists() && content.String() != "" {
 			block := []byte(`{"type":"text","text":""}`)
 			block, _ = sjson.SetBytes(block, "text", content.String())
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
+			contentBlocks = append(contentBlocks, block)
 		}
 
 		// Handle tool calls
@@ -479,9 +470,13 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 					toolUseBlock, _ = sjson.SetRawBytes(toolUseBlock, "input", []byte(`{}`))
 				}
 
-				out, _ = sjson.SetRawBytes(out, "content.-1", toolUseBlock)
+				contentBlocks = append(contentBlocks, toolUseBlock)
 				return true
 			})
+		}
+
+		if len(contentBlocks) > 0 {
+			out = translatorcommon.SetRawArrayItems(out, "content", contentBlocks)
 		}
 
 		// Set stop reason
@@ -607,6 +602,29 @@ func emitToolUseStart(param *ConvertOpenAIResponseToAnthropicParams, openAIToolI
 	param.SawToolCall = true
 }
 
+// emitBelatedToolUseStart finalizes a tool_use block that never received a
+// mid-stream start. Some OpenAI-compatible providers leave function.name empty
+// for the whole stream; dropping those calls loses tool_use for Claude Code and
+// can trigger retry loops. When name is still empty but the call has an id
+// and/or arguments, synthesize tool_<index> instead of silently discarding it.
+// Returns false when the accumulator has no usable tool-call signal.
+func emitBelatedToolUseStart(param *ConvertOpenAIResponseToAnthropicParams, openAIToolIndex int, accumulator *ToolCallAccumulator, results *[][]byte) bool {
+	if accumulator == nil {
+		return false
+	}
+	if accumulator.StartEmitted {
+		return true
+	}
+	if accumulator.Name == "" && accumulator.ID == "" && accumulator.Arguments.Len() == 0 {
+		return false
+	}
+	if accumulator.Name == "" {
+		accumulator.Name = fmt.Sprintf("tool_%d", openAIToolIndex)
+	}
+	emitToolUseStart(param, openAIToolIndex, accumulator, results)
+	return true
+}
+
 func toolCallAccumulatorIndexes(accumulators map[int]*ToolCallAccumulator) []int {
 	indexes := make([]int, 0, len(accumulators))
 	for index := range accumulators {
@@ -637,6 +655,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 	hasToolCall := false
 	stopReasonSet := false
+	var blocks [][]byte
 
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
 		choice := choices.Array()[0]
@@ -658,7 +677,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						}
 						block := []byte(`{"type":"text","text":""}`)
 						block, _ = sjson.SetBytes(block, "text", textBuilder.String())
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						blocks = append(blocks, block)
 						textBuilder.Reset()
 					}
 
@@ -668,7 +687,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						}
 						block := []byte(`{"type":"thinking","thinking":""}`)
 						block, _ = sjson.SetBytes(block, "thinking", thinkingBuilder.String())
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						blocks = append(blocks, block)
 						thinkingBuilder.Reset()
 					}
 
@@ -700,7 +719,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 										toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(`{}`))
 									}
 
-									out, _ = sjson.SetRawBytes(out, "content.-1", toolUse)
+									blocks = append(blocks, toolUse)
 									return true
 								})
 							}
@@ -722,7 +741,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					if textContent != "" {
 						block := []byte(`{"type":"text","text":""}`)
 						block, _ = sjson.SetBytes(block, "text", textContent)
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						blocks = append(blocks, block)
 					}
 				}
 			}
@@ -741,7 +760,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					}
 					block := []byte(`{"type":"thinking","thinking":""}`)
 					block, _ = sjson.SetBytes(block, "thinking", reasoningText)
-					out, _ = sjson.SetRawBytes(out, "content.-1", block)
+					blocks = append(blocks, block)
 				}
 			}
 
@@ -764,11 +783,15 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						toolUseBlock, _ = sjson.SetRawBytes(toolUseBlock, "input", []byte(`{}`))
 					}
 
-					out, _ = sjson.SetRawBytes(out, "content.-1", toolUseBlock)
+					blocks = append(blocks, toolUseBlock)
 					return true
 				})
 			}
 		}
+	}
+
+	if len(blocks) > 0 {
+		out, _ = sjson.SetRawBytes(out, "content", translatorcommon.JoinRawArray(blocks))
 	}
 
 	if respUsage := root.Get("usage"); respUsage.Exists() {
