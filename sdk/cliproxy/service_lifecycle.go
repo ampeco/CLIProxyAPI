@@ -20,6 +20,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// startupModelRefreshWait caps how long a start waits for the first catalog
+// fetch. A fetch normally takes under a second; a black-holed network would
+// otherwise hold the port closed for the full 2 x 30 s fetch timeouts.
+const startupModelRefreshWait = 10 * time.Second
+
 // Run starts the service and blocks until the context is cancelled or the server stops.
 // It initializes all components including authentication, file watching, HTTP server,
 // and starts processing requests. The method blocks until the context is cancelled.
@@ -125,9 +130,12 @@ func (s *Service) Run(ctx context.Context) error {
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
 	s.syncPluginRuntimeConfig(ctx)
-	if homeEnabled {
-		s.syncPluginModelRuntime(ctx)
-	}
+	// Register models for the auths loaded above before the listener
+	// opens; otherwise requests that arrive before the watcher's first load
+	// fail with model_not_found. Wait for the first catalog fetch first, so
+	// the registration includes models newer than the embedded catalog.
+	registry.WaitForStartupModelRefresh(ctx, startupModelRefreshWait)
+	s.syncPluginModelRuntime(ctx)
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()
