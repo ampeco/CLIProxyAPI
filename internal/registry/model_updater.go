@@ -38,6 +38,42 @@ var modelsCatalogStore = &modelStore{}
 
 var updaterOnce sync.Once
 
+// The first catalog fetch runs in the background. Service.Run waits for it
+// (bounded) so models newer than the embedded catalog are registered before
+// the listener opens instead of answering 400 unknown provider.
+var (
+	startupRefreshStarted  = make(chan struct{})
+	startupRefreshFinished = make(chan struct{})
+	startupRefreshDoneOnce sync.Once
+)
+
+func markStartupModelRefreshFinished() {
+	startupRefreshDoneOnce.Do(func() { close(startupRefreshFinished) })
+}
+
+// WaitForStartupModelRefresh blocks until the first model catalog fetch has
+// finished (successfully or not), the timeout passes, or ctx ends. It returns
+// at once when the updater was never started (local-model or Home mode).
+// It reports whether the first fetch finished.
+func WaitForStartupModelRefresh(ctx context.Context, timeout time.Duration) bool {
+	select {
+	case <-startupRefreshStarted:
+	default:
+		return false
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-startupRefreshFinished:
+		return true
+	case <-timer.C:
+		log.Warnf("startup model refresh still running after %s; opening the listener with the current catalog", timeout)
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // ModelRefreshCallback is invoked when startup or periodic model refresh detects changes.
 // changedProviders contains the provider names whose model definitions changed.
 type ModelRefreshCallback func(changedProviders []string)
@@ -78,12 +114,16 @@ func init() {
 // Safe to call multiple times; only one updater will run.
 func StartModelsUpdater(ctx context.Context) {
 	updaterOnce.Do(func() {
+		close(startupRefreshStarted)
 		go runModelsUpdater(ctx)
 	})
 }
 
 func runModelsUpdater(ctx context.Context) {
-	runModelCatalogUpdater(ctx, "model refresh", tryRefreshModels)
+	runModelCatalogUpdater(ctx, "model refresh", func(ctx context.Context, label string) bool {
+		defer markStartupModelRefreshFinished()
+		return tryRefreshModels(ctx, label)
+	})
 }
 
 // runModelCatalogUpdater keeps failed refreshes from leaving the fallback catalog
